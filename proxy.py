@@ -467,6 +467,9 @@ def handle_iclock_cdata_post() -> Response:
     # ---------------------------------------------------------
     elif table == 'USERINFO':
         print(f'[iclock/cdata POST] USERINFO bulk sync, bodyLength={len(raw_data)}')
+    elif table == 'OPERLOG':
+        print(f'[iclock/cdata POST] OPERLOG, sn={sn!r}, bodyLength={len(raw_data)}')
+        return text_response('OK')
     else:
         print('[iclock/cdata POST] unhandled or missing table param', {
             'table': table,
@@ -478,6 +481,7 @@ def handle_iclock_cdata_post() -> Response:
 
 
 @app.route('/iclock/cdata', methods=['GET', 'POST'], strict_slashes=False)
+@app.route('/iclock/cdata.aspx', methods=['GET', 'POST'], strict_slashes=False)
 def iclock_cdata():
     if request.method == 'GET':
         return handle_iclock_cdata_get()
