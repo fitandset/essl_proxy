@@ -329,15 +329,21 @@ def handle_iclock_cdata_post() -> Response:
                         }
 
                 logs_to_insert: List[Dict[str, Any]] = []
+                skipped_no_profile = 0
                 for punch in parsed_punches:
                     punch_time = punch_timestamp_to_iso(punch.get('timestamp'))
                     eid = (punch.get('esslId') or '').strip()
                     resolved = bio_by_essl_id.get(eid) if eid else None
+                    r = resolved or {}
+                    # Only persist when essl_biometrics maps to user (profile) or profile_gym
+                    if not (r.get('user_id') or r.get('profile_gym_id')):
+                        skipped_no_profile += 1
+                        continue
                     logs_to_insert.append({
                         'gym_id': device['gym_id'],
                         'device_id': device['id'],
-                        'user_id': (resolved or {}).get('user_id'),
-                        'profile_gym_id': (resolved or {}).get('profile_gym_id'),
+                        'user_id': r.get('user_id'),
+                        'profile_gym_id': r.get('profile_gym_id'),
                         'essl_id': eid or None,
                         'punch_time': punch_time,
                         'punch_type': get_punch_type(punch['status']),
@@ -347,17 +353,26 @@ def handle_iclock_cdata_post() -> Response:
                         'is_manual_entry': False,
                     })
 
+                if skipped_no_profile > 0:
+                    print('[iclock/cdata ATTLOG] skipped punches (no user_id or profile_gym_id)', {
+                        'skippedNoProfile': skipped_no_profile,
+                    })
+
+                before_time_filter = len(logs_to_insert)
                 logs_to_insert = [r for r in logs_to_insert if r.get('punch_time')]
-                skipped_bad_time = len(parsed_punches) - len(logs_to_insert)
+                skipped_bad_time = before_time_filter - len(logs_to_insert)
                 if skipped_bad_time > 0:
                     print('[iclock/cdata ATTLOG] skipped rows with invalid punch_time', {
                         'skippedBadTime': skipped_bad_time,
                     })
 
-                deduplicated = dedupe_attendance_logs(logs_to_insert)
+                deduplicated = dedupe_attendance_logs(logs_to_insert, window_ms=10_000)
                 dedup_skipped = len(logs_to_insert) - len(deduplicated)
                 if dedup_skipped > 0:
-                    print(f'[iclock/cdata ATTLOG] deduped {dedup_skipped} punch(es) within 10000ms window')
+                    print(
+                        f'[iclock/cdata ATTLOG] deduped {dedup_skipped} punch(es) '
+                        f'(same essl_id within 10s → kept latest only)'
+                    )
 
                 print('[iclock/cdata ATTLOG] rows to insert', {
                     'count': len(deduplicated),
