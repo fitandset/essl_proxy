@@ -488,6 +488,12 @@ def iclock_cdata():
     return handle_iclock_cdata_post()
 
 
+@app.route('/iclock/getrequest', methods=['GET'], strict_slashes=False)
+@app.route('/iclock/getrequest.aspx', methods=['GET'], strict_slashes=False)
+def iclock_getrequest():
+    return handle_iclock_cdata_get()
+
+
 if __name__ == '__main__':
     # Render provides the port automatically via the PORT environment variable
     port = int(os.environ.get('PORT', 10000))
