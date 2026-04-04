@@ -56,6 +56,28 @@ def get_punch_type(status_code: int) -> str:
     return statuses.get(status_code, 'check-in')
 
 
+def preprocess_biometric_iclock_line(table: str, line: str) -> str:
+    """BIODATA lines often start with 'BIODATA Pin=...' (space) or 'BIODATA\\t...'."""
+    s = line.strip()
+    if table != 'BIODATA':
+        return line
+    upper = s.upper()
+    if upper.startswith('BIODATA\t'):
+        return s[8:].lstrip()
+    if upper.startswith('BIODATA '):
+        return s[8:].lstrip()
+    return line
+
+
+def zk_push_biodata_type_to_biometric_type(type_code: int) -> str:
+    """Map ZK push BIODATA Type to essl_biometrics.biometric_type (firmware-dependent)."""
+    if type_code == 9:
+        return 'FACE'
+    if 0 <= type_code <= 8:
+        return 'FINGERPRINT'
+    return f'ZK_BIODATA_{type_code}'
+
+
 def fetch_essl_biometrics_for_pins(
     supabase: Client,
     gym_id: str,
@@ -396,9 +418,9 @@ def handle_iclock_cdata_post() -> Response:
                 print('[iclock/cdata ATTLOG] exception:', err)
 
     # ---------------------------------------------------------
-    # BIOMETRIC TEMPLATES (FINGERTMP / FPINFO / FACE)
+    # BIOMETRIC TEMPLATES (FINGERTMP / FPINFO / FACE / BIODATA)
     # ---------------------------------------------------------
-    elif table in ('FINGERTMP', 'FPINFO', 'FACE'):
+    elif table in ('FINGERTMP', 'FPINFO', 'FACE', 'BIODATA'):
         if not sb:
             print(f'[iclock/cdata {table}] Supabase not configured; skipping DB work')
         else:
@@ -426,6 +448,9 @@ def handle_iclock_cdata_post() -> Response:
                     line = line.rstrip('\r')
                     if not line.strip():
                         continue
+                    line = preprocess_biometric_iclock_line(table, line)
+                    if not line.strip():
+                        continue
                     pairs = line.split('\t')
                     bio_obj: Dict[str, str] = {}
                     for pair in pairs:
@@ -435,17 +460,41 @@ def handle_iclock_cdata_post() -> Response:
                         k = pair[:eq].strip()
                         v = pair[eq + 1 :].strip()
                         if k:
-                            bio_obj[k] = v
+                            bio_obj[k.upper()] = v
 
                     if bio_obj.get('PIN') and bio_obj.get('TMP'):
                         pin = bio_obj['PIN'].strip()
+                        if table == 'FACE':
+                            biometric_type = 'FACE'
+                        elif table == 'BIODATA':
+                            try:
+                                type_code = int(bio_obj.get('TYPE') or '0', 10)
+                            except ValueError:
+                                type_code = 0
+                            biometric_type = zk_push_biodata_type_to_biometric_type(
+                                type_code
+                            )
+                        else:
+                            biometric_type = 'FINGERPRINT'
+                        fid_raw = bio_obj.get('FID') or bio_obj.get('INDEX') or '0'
+                        fid = int(fid_raw, 10)
+                        try:
+                            size = int(bio_obj.get('SIZE') or '0', 10)
+                        except ValueError:
+                            size = 0
+                        if size == 0 and bio_obj.get('TMP'):
+                            size = len(bio_obj['TMP'])
+                        try:
+                            valid = int(bio_obj.get('VALID') or '1', 10)
+                        except ValueError:
+                            valid = 1
                         biometrics_to_insert.append({
                             'gym_id': dev['gym_id'],
                             'essl_id': pin,
-                            'biometric_type': 'FACE' if table == 'FACE' else 'FINGERPRINT',
-                            'fid': int(bio_obj.get('FID') or '0', 10),
-                            'size': int(bio_obj.get('Size') or '0', 10),
-                            'valid': int(bio_obj.get('Valid') or '1', 10),
+                            'biometric_type': biometric_type,
+                            'fid': fid,
+                            'size': size,
+                            'valid': valid,
                             'tmp': bio_obj['TMP'],
                             'user_id': None,
                         })
