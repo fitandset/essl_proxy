@@ -186,15 +186,36 @@ def handle_iclock_cdata_get() -> Response:
     return text_response('OK')
 
 
+def _attendance_dedupe_key(log: Dict[str, Any]) -> tuple:
+    """(gym_id, device_id, person): person is user_id when set, else profile_gym_id."""
+    gym_id = log.get('gym_id')
+    device_id = log.get('device_id')
+    uid = log.get('user_id')
+    if uid is not None and str(uid).strip():
+        person: tuple = ('user', str(uid))
+    else:
+        pgid = log.get('profile_gym_id')
+        if pgid is not None and str(pgid).strip():
+            person = ('profile', str(pgid))
+        else:
+            eid = (log.get('essl_id') or '').strip() or f'__no_id_{uuid.uuid4()}'
+            person = ('essl', eid)
+    return (gym_id, device_id, person)
+
+
 def dedupe_attendance_logs(logs_to_insert: list, window_ms: int = 10_000) -> list:
     grouped: dict = {}
     for log in logs_to_insert:
-        key = (log.get('essl_id') or '').strip() or f'__no_id_{uuid.uuid4()}'
+        key = _attendance_dedupe_key(log)
         grouped.setdefault(key, []).append(log)
 
     result: list = []
-    for essl_id, punches in grouped.items():
-        if essl_id.startswith('__no_id_') or len(punches) == 1:
+    for dedupe_key, punches in grouped.items():
+        _gym, _dev, person = dedupe_key
+        if len(punches) == 1:
+            result.extend(punches)
+            continue
+        if person[0] == 'essl' and str(person[1]).startswith('__no_id_'):
             result.extend(punches)
             continue
 
@@ -214,6 +235,28 @@ def dedupe_attendance_logs(logs_to_insert: list, window_ms: int = 10_000) -> lis
                 cluster_latest = punches[i]
         result.append(cluster_latest)
     return result
+
+
+ATTLOG_DEDUPE_WINDOW_SECONDS = 10
+
+
+def _attendance_row_for_rpc(row: Dict[str, Any]) -> Dict[str, Any]:
+    """JSON-serializable payload for insert_attendance_logs_deduped_batch (Supabase RPC)."""
+    uid = row.get('user_id')
+    pgid = row.get('profile_gym_id')
+    return {
+        'gym_id': str(row['gym_id']),
+        'device_id': str(row['device_id']),
+        'user_id': str(uid) if uid is not None and str(uid).strip() else None,
+        'profile_gym_id': str(pgid) if pgid is not None and str(pgid).strip() else None,
+        'essl_id': row.get('essl_id'),
+        'punch_time': row['punch_time'],
+        'punch_type': row['punch_type'],
+        'verify_method': row['verify_method'],
+        'raw_status': row['raw_status'],
+        'raw_verify_type': row['raw_verify_type'],
+        'is_manual_entry': bool(row.get('is_manual_entry', False)),
+    }
 
 
 def handle_iclock_cdata_post() -> Response:
@@ -388,29 +431,44 @@ def handle_iclock_cdata_post() -> Response:
                         'skippedBadTime': skipped_bad_time,
                     })
 
-                deduplicated = dedupe_attendance_logs(logs_to_insert, window_ms=10_000)
+                deduplicated = dedupe_attendance_logs(
+                    logs_to_insert, window_ms=ATTLOG_DEDUPE_WINDOW_SECONDS * 1000
+                )
                 dedup_skipped = len(logs_to_insert) - len(deduplicated)
                 if dedup_skipped > 0:
                     print(
                         f'[iclock/cdata ATTLOG] deduped {dedup_skipped} punch(es) '
-                        f'(same essl_id within 10s → kept latest only)'
+                        f'(same gym/device/person within 10s → kept latest only)'
                     )
 
-                print('[iclock/cdata ATTLOG] rows to insert', {
+                print('[iclock/cdata ATTLOG] rows after in-request dedupe', {
                     'count': len(deduplicated),
                     'sampleRow': deduplicated[0] if deduplicated else None,
                 })
 
                 if deduplicated:
                     try:
-                        ins = sb.table('attendance_logs').insert(deduplicated).execute()
-                        inserted = ins.data or []
-                        print('[iclock/cdata ATTLOG] insert ok', {
-                            'insertedCount': len(inserted) if inserted else len(deduplicated),
-                            'gymId': device['gym_id'],
-                        })
+                        p_rows = [_attendance_row_for_rpc(r) for r in deduplicated]
+                        rpc_res = sb.rpc(
+                            'insert_attendance_logs_deduped_batch',
+                            {'p_rows': p_rows},
+                        ).execute()
+                        stats = rpc_res.data
+                        if isinstance(stats, list) and stats:
+                            stats = stats[0]
+                        if not isinstance(stats, dict):
+                            stats = {}
+                        if stats.get('error'):
+                            print('[iclock/cdata ATTLOG] insert_attendance_logs_deduped_batch:', stats)
+                        else:
+                            print('[iclock/cdata ATTLOG] insert_attendance_logs_deduped_batch ok', {
+                                'inserted': stats.get('inserted'),
+                                'skipped': stats.get('skipped'),
+                                'gymId': device['gym_id'],
+                                'note': 'skipped = duplicate in DB within ±10s (atomic per row)',
+                            })
                     except APIError as insert_error:
-                        print('[iclock/cdata ATTLOG] insert failed:', insert_error)
+                        print('[iclock/cdata ATTLOG] RPC insert_attendance_logs_deduped_batch failed:', insert_error)
                 else:
                     print('[iclock/cdata ATTLOG] no rows to insert (empty or unparsed body)')
 
@@ -497,6 +555,7 @@ def handle_iclock_cdata_post() -> Response:
                             'valid': valid,
                             'tmp': bio_obj['TMP'],
                             'user_id': None,
+                            'essl_enabled': True,
                         })
                         essl_ids_to_lookup.add(pin)
 
