@@ -3,7 +3,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from postgrest.exceptions import APIError
 from supabase import create_client, Client
@@ -575,11 +575,48 @@ def handle_iclock_cdata_post() -> Response:
 
                 if final_insert_data:
                     try:
-                        sb.table('essl_biometrics').upsert(
-                            final_insert_data,
-                            on_conflict='gym_id,essl_id,biometric_type,fid',
-                        ).execute()
-                        print(f'[iclock/cdata {table}] saved {len(final_insert_data)} template(s)')
+                        # Placeholder rows (e.g. profile-linked with profile_gym_id) often have
+                        # biometric_type NULL. Upsert on (gym_id, essl_id, biometric_type, fid) does
+                        # not match NULL vs 'FACE', so merge into those rows by id first.
+                        ph_res = (
+                            sb.table('essl_biometrics')
+                            .select('id, essl_id, fid')
+                            .eq('gym_id', dev['gym_id'])
+                            .in_('essl_id', pin_list)
+                            .is_('biometric_type', 'null')
+                            .execute()
+                        )
+                        placeholder_by_pin_fid: Dict[Tuple[str, int], str] = {}
+                        for row in ph_res.data or []:
+                            eid = str(row.get('essl_id', '')).strip()
+                            fid_v = row.get('fid')
+                            if eid and fid_v is not None:
+                                placeholder_by_pin_fid[(eid, int(fid_v))] = row['id']
+
+                        merge_by_id: List[Dict[str, Any]] = []
+                        upsert_rest: List[Dict[str, Any]] = []
+                        for b in final_insert_data:
+                            key = (str(b['essl_id']).strip(), int(b['fid']))
+                            pid = placeholder_by_pin_fid.get(key)
+                            if pid:
+                                merge_by_id.append({**b, 'id': pid})
+                            else:
+                                upsert_rest.append(b)
+
+                        if merge_by_id:
+                            sb.table('essl_biometrics').upsert(
+                                merge_by_id,
+                                on_conflict='id',
+                            ).execute()
+                        if upsert_rest:
+                            sb.table('essl_biometrics').upsert(
+                                upsert_rest,
+                                on_conflict='gym_id,essl_id,biometric_type,fid',
+                            ).execute()
+                        print(
+                            f'[iclock/cdata {table}] saved {len(final_insert_data)} template(s) '
+                            f'(merge_by_id={len(merge_by_id)}, upsert={len(upsert_rest)})'
+                        )
                     except APIError as insert_error:
                         print(f'[iclock/cdata {table}] upsert failed:', insert_error)
             except Exception as err:
@@ -615,6 +652,24 @@ def iclock_cdata():
 @app.route('/iclock/getrequest.aspx', methods=['GET'], strict_slashes=False)
 def iclock_getrequest():
     return handle_iclock_cdata_get()
+
+
+@app.route('/iclock/devicecmd', methods=['POST'], strict_slashes=False)
+@app.route('/iclock/devicecmd.aspx', methods=['POST'], strict_slashes=False)
+def iclock_devicecmd():
+    """Device posts command execution results; acknowledge with OK (ZK / similar firmware)."""
+    sn = request.args.get('SN')
+    raw_data = request.get_data(as_text=True)
+    raw_preview = (
+        raw_data[:400]
+        .replace('\t', '\\t')
+        .replace('\r', '\\r')
+        .replace('\n', '\\n')
+    )
+    if len(raw_data) > 400:
+        raw_preview = f'{raw_preview}...'
+    print(f'DEVICE CMD RESPONSE [{sn}]:', raw_preview)
+    return text_response('OK')
 
 
 if __name__ == '__main__':
