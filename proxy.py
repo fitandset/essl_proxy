@@ -2,7 +2,7 @@ from flask import Flask, request, Response
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from postgrest.exceptions import APIError
@@ -78,6 +78,17 @@ def zk_push_biodata_type_to_biometric_type(type_code: int) -> str:
     return f'ZK_BIODATA_{type_code}'
 
 
+def parse_iclock_int_field(bio_obj: Dict[str, str], key: str) -> Optional[int]:
+    """Parse tab-delimited KEY=value field to int; missing or invalid → None."""
+    v = bio_obj.get(key)
+    if v is None or v == '':
+        return None
+    try:
+        return int(v, 10)
+    except ValueError:
+        return None
+
+
 def fetch_essl_biometrics_for_pins(
     supabase: Client,
     gym_id: str,
@@ -127,6 +138,35 @@ def punch_timestamp_to_iso(timestamp: Optional[str]) -> Optional[str]:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+BIODATA_COMMAND_SEND_DELAY_SEC = 20
+
+
+def _parse_device_command_created_at(created_at: Any) -> Optional[datetime]:
+    if created_at is None:
+        return None
+    if isinstance(created_at, datetime):
+        dt = created_at
+    else:
+        s = str(created_at).strip()
+        if not s:
+            return None
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _device_command_ready_to_send(command: Dict[str, Any], now: datetime) -> bool:
+    if not command.get('is_biodata'):
+        return True
+    dt = _parse_device_command_created_at(command.get('created_at'))
+    if dt is None:
+        return True
+    return now >= dt + timedelta(seconds=BIODATA_COMMAND_SEND_DELAY_SEC)
+
+
 def handle_iclock_cdata_get() -> Response:
     sn = request.args.get('SN')
     table = request.args.get('table')
@@ -158,7 +198,8 @@ def handle_iclock_cdata_get() -> Response:
         except APIError as update_err:
             print('[iclock/cdata GET] gym_devices update error:', update_err)
 
-        # Oldest pending command for this machine (same as Next.js /iclock/cdata GET)
+        # Pending commands for this machine (by id). Biodata rows wait BIODATA_COMMAND_SEND_DELAY_SEC
+        # after created_at so non-biodata commands (e.g. update user) ahead in the queue go first.
         try:
             cmd_res = (
                 sb.table('device_commands')
@@ -166,12 +207,17 @@ def handle_iclock_cdata_get() -> Response:
                 .eq('device_sn', sn)
                 .eq('status', 'pending')
                 .order('id', desc=False)
-                .limit(1)
+                .limit(100)
                 .execute()
             )
             cmd_rows = cmd_res.data or []
-            if cmd_rows:
-                command = cmd_rows[0]
+            now_utc = datetime.now(timezone.utc)
+            command = None
+            for row in cmd_rows:
+                if _device_command_ready_to_send(row, now_utc):
+                    command = row
+                    break
+            if command:
                 formatted_command = f"C:{command['id']}:{command['command_string']}\n"
                 print(f'>>> SENDING COMMAND TO {sn}:', formatted_command.strip())
                 sb.table('device_commands').update({'status': 'sent'}).eq(
@@ -526,11 +572,11 @@ def handle_iclock_cdata_post() -> Response:
                             biometric_type = 'FACE'
                         elif table == 'BIODATA':
                             try:
-                                type_code = int(bio_obj.get('TYPE') or '0', 10)
+                                biodata_type = int(bio_obj.get('TYPE') or '0', 10)
                             except ValueError:
-                                type_code = 0
+                                biodata_type = 0
                             biometric_type = zk_push_biodata_type_to_biometric_type(
-                                type_code
+                                biodata_type
                             )
                         else:
                             biometric_type = 'FINGERPRINT'
@@ -546,7 +592,7 @@ def handle_iclock_cdata_post() -> Response:
                             valid = int(bio_obj.get('VALID') or '1', 10)
                         except ValueError:
                             valid = 1
-                        biometrics_to_insert.append({
+                        entry: Dict[str, Any] = {
                             'gym_id': dev['gym_id'],
                             'essl_id': pin,
                             'biometric_type': biometric_type,
@@ -556,7 +602,17 @@ def handle_iclock_cdata_post() -> Response:
                             'tmp': bio_obj['TMP'],
                             'user_id': None,
                             'essl_enabled': True,
-                        })
+                        }
+                        if table == 'BIODATA':
+                            entry['type'] = biodata_type
+                            entry['major_ver'] = parse_iclock_int_field(
+                                bio_obj, 'MAJORVER'
+                            )
+                            entry['minor_ver'] = parse_iclock_int_field(
+                                bio_obj, 'MINORVER'
+                            )
+                            entry['format'] = parse_iclock_int_field(bio_obj, 'FORMAT')
+                        biometrics_to_insert.append(entry)
                         essl_ids_to_lookup.add(pin)
 
                 pin_list = list(essl_ids_to_lookup)
