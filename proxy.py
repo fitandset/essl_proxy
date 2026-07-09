@@ -69,6 +69,31 @@ def preprocess_biometric_iclock_line(table: str, line: str) -> str:
     return line
 
 
+def preprocess_operlog_fp_line(line: str) -> Optional[str]:
+    """OPERLOG fingerprint enrollments: 'FP PIN=...\\tFID=...\\tTMP=...'."""
+    s = line.strip()
+    upper = s.upper()
+    if upper.startswith('FP\t'):
+        return s[3:].lstrip()
+    if upper.startswith('FP '):
+        return s[3:].lstrip()
+    return None
+
+
+def parse_iclock_kv_line(line: str) -> Dict[str, str]:
+    """Parse tab-delimited KEY=value pairs; keys uppercased."""
+    bio_obj: Dict[str, str] = {}
+    for pair in line.split('\t'):
+        eq = pair.find('=')
+        if eq == -1:
+            continue
+        k = pair[:eq].strip()
+        v = pair[eq + 1 :].strip()
+        if k:
+            bio_obj[k.upper()] = v
+    return bio_obj
+
+
 def zk_push_biodata_type_to_biometric_type(type_code: int) -> str:
     """Map ZK push BIODATA Type to essl_biometrics.biometric_type (firmware-dependent)."""
     if type_code == 9:
@@ -115,6 +140,167 @@ def fetch_essl_biometrics_for_pins(
         nums = [int(s, 10) for s in essl_id_list]
         return run_in(nums)
     return rows, err
+
+
+def build_fingerprint_biodata_update_command(entry: Dict[str, Any]) -> str:
+    """ZK DATA UPDATE BIODATA for a fingerprint template (Index = FID)."""
+    pin = entry['essl_id']
+    fid = int(entry['fid'])
+    valid = int(entry.get('valid') if entry.get('valid') is not None else 1)
+    size = int(entry.get('size') or 0)
+    tmp = entry['tmp']
+    bio_type = entry.get('type')
+    if bio_type is None:
+        bio_type = 0
+    major_ver = entry.get('major_ver')
+    if major_ver is None:
+        major_ver = 0
+    minor_ver = entry.get('minor_ver')
+    if minor_ver is None:
+        minor_ver = 0
+    fmt = entry.get('format')
+    if fmt is None:
+        fmt = 0
+    return (
+        f'DATA UPDATE BIODATA\tPin={pin}\tNo=0\tIndex={fid}\tValid={valid}\t'
+        f'Duress=0\tType={bio_type}\tMajorVer={major_ver}\tMinorVer={minor_ver}\t'
+        f'Format={fmt}\tSize={size}\tTmp={tmp}'
+    )
+
+
+def queue_fingerprint_biodata_updates(
+    supabase: Client,
+    gym_id: str,
+    source_sn: str,
+    templates: List[Dict[str, Any]],
+) -> None:
+    """Push enrolled fingerprints to other devices in the same gym via device_commands."""
+    if not templates:
+        return
+    try:
+        dev_res = (
+            supabase.table('gym_devices')
+            .select('serial_number')
+            .eq('gym_id', gym_id)
+            .execute()
+        )
+        target_sns = [
+            str(r.get('serial_number') or '').strip()
+            for r in (dev_res.data or [])
+            if str(r.get('serial_number') or '').strip()
+            and str(r.get('serial_number') or '').strip() != source_sn
+        ]
+        if not target_sns:
+            print(
+                '[iclock/cdata OPERLOG] no other gym devices for BIODATA sync',
+                {'gymId': gym_id, 'sourceSn': source_sn, 'templateCount': len(templates)},
+            )
+            return
+
+        rows: List[Dict[str, Any]] = []
+        for sn in target_sns:
+            for entry in templates:
+                rows.append({
+                    'gym_id': gym_id,
+                    'device_sn': sn,
+                    'command_string': build_fingerprint_biodata_update_command(entry),
+                    'status': 'pending',
+                    'is_biodata': True,
+                })
+        if rows:
+            supabase.table('device_commands').insert(rows).execute()
+            print(
+                '[iclock/cdata OPERLOG] queued DATA UPDATE BIODATA',
+                {
+                    'gymId': gym_id,
+                    'sourceSn': source_sn,
+                    'targetDevices': len(target_sns),
+                    'commands': len(rows),
+                },
+            )
+    except APIError as err:
+        print('[iclock/cdata OPERLOG] queue BIODATA commands failed:', err)
+    except Exception as err:
+        print('[iclock/cdata OPERLOG] queue BIODATA commands exception:', err)
+
+
+def save_essl_biometric_templates(
+    supabase: Client,
+    gym_id: str,
+    table_label: str,
+    biometrics_to_insert: List[Dict[str, Any]],
+) -> int:
+    """Resolve user_id, merge placeholders, upsert templates. Returns saved count."""
+    if not biometrics_to_insert:
+        return 0
+
+    pin_list = list({str(b['essl_id']).strip() for b in biometrics_to_insert if b.get('essl_id')})
+    users_info, _ = fetch_essl_biometrics_for_pins(supabase, gym_id, pin_list)
+    user_map: Dict[str, str] = {}
+    if users_info:
+        for u in users_info:
+            uid = u.get('user_id')
+            if uid:
+                user_map[str(u.get('essl_id', '')).strip()] = uid
+
+    final_insert_data = [
+        {**b, 'user_id': user_map.get(b['essl_id'])}
+        for b in biometrics_to_insert
+    ]
+
+    # Placeholder rows (e.g. profile-linked) often have biometric_type NULL. Upsert on
+    # (gym_id, essl_id, biometric_type, fid) does not match NULL vs 'FINGERPRINT'/'FACE'.
+    ph_res = (
+        supabase.table('essl_biometrics')
+        .select('id, essl_id, fid')
+        .eq('gym_id', gym_id)
+        .in_('essl_id', pin_list)
+        .is_('biometric_type', 'null')
+        .execute()
+    )
+    placeholder_by_pin_fid: Dict[Tuple[str, int], str] = {}
+    placeholder_by_pin: Dict[str, str] = {}
+    for row in ph_res.data or []:
+        eid = str(row.get('essl_id', '')).strip()
+        fid_v = row.get('fid')
+        if not eid:
+            continue
+        if fid_v is not None:
+            placeholder_by_pin_fid[(eid, int(fid_v))] = row['id']
+        # First null-type row for this PIN (e.g. fid=0 placeholder + FP FID=6)
+        if eid not in placeholder_by_pin:
+            placeholder_by_pin[eid] = row['id']
+
+    merge_by_id: List[Dict[str, Any]] = []
+    upsert_rest: List[Dict[str, Any]] = []
+    used_placeholder_ids: Set[str] = set()
+    for b in final_insert_data:
+        eid = str(b['essl_id']).strip()
+        key = (eid, int(b['fid']))
+        pid = placeholder_by_pin_fid.get(key)
+        if not pid:
+            pid = placeholder_by_pin.get(eid)
+        if pid and pid not in used_placeholder_ids:
+            used_placeholder_ids.add(pid)
+            merge_by_id.append({**b, 'id': pid})
+        else:
+            upsert_rest.append(b)
+
+    if merge_by_id:
+        supabase.table('essl_biometrics').upsert(
+            merge_by_id,
+            on_conflict='id',
+        ).execute()
+    if upsert_rest:
+        supabase.table('essl_biometrics').upsert(
+            upsert_rest,
+            on_conflict='gym_id,essl_id,biometric_type,fid',
+        ).execute()
+    print(
+        f'[iclock/cdata {table_label}] saved {len(final_insert_data)} template(s) '
+        f'(merge_by_id={len(merge_by_id)}, upsert={len(upsert_rest)})'
+    )
+    return len(final_insert_data)
 
 
 def punch_timestamp_to_iso(timestamp: Optional[str]) -> Optional[str]:
@@ -546,7 +732,6 @@ def handle_iclock_cdata_post() -> Response:
 
                 lines = raw_data.split('\n')
                 biometrics_to_insert: List[Dict[str, Any]] = []
-                essl_ids_to_lookup: Set[str] = set()
 
                 for line in lines:
                     line = line.rstrip('\r')
@@ -555,19 +740,11 @@ def handle_iclock_cdata_post() -> Response:
                     line = preprocess_biometric_iclock_line(table, line)
                     if not line.strip():
                         continue
-                    pairs = line.split('\t')
-                    bio_obj: Dict[str, str] = {}
-                    for pair in pairs:
-                        eq = pair.find('=')
-                        if eq == -1:
-                            continue
-                        k = pair[:eq].strip()
-                        v = pair[eq + 1 :].strip()
-                        if k:
-                            bio_obj[k.upper()] = v
+                    bio_obj = parse_iclock_kv_line(line)
 
                     if bio_obj.get('PIN') and bio_obj.get('TMP'):
                         pin = bio_obj['PIN'].strip()
+                        biodata_type = 0
                         if table == 'FACE':
                             biometric_type = 'FACE'
                         elif table == 'BIODATA':
@@ -581,7 +758,10 @@ def handle_iclock_cdata_post() -> Response:
                         else:
                             biometric_type = 'FINGERPRINT'
                         fid_raw = bio_obj.get('FID') or bio_obj.get('INDEX') or '0'
-                        fid = int(fid_raw, 10)
+                        try:
+                            fid = int(fid_raw, 10)
+                        except ValueError:
+                            fid = 0
                         try:
                             size = int(bio_obj.get('SIZE') or '0', 10)
                         except ValueError:
@@ -613,65 +793,11 @@ def handle_iclock_cdata_post() -> Response:
                             )
                             entry['format'] = parse_iclock_int_field(bio_obj, 'FORMAT')
                         biometrics_to_insert.append(entry)
-                        essl_ids_to_lookup.add(pin)
 
-                pin_list = list(essl_ids_to_lookup)
-                users_info, _ = fetch_essl_biometrics_for_pins(sb, dev['gym_id'], pin_list)
-                user_map: Dict[str, str] = {}
-                if users_info:
-                    for u in users_info:
-                        uid = u.get('user_id')
-                        if uid:
-                            user_map[str(u.get('essl_id', '')).strip()] = uid
-
-                final_insert_data = [
-                    {**b, 'user_id': user_map.get(b['essl_id'])}
-                    for b in biometrics_to_insert
-                ]
-
-                if final_insert_data:
+                if biometrics_to_insert:
                     try:
-                        # Placeholder rows (e.g. profile-linked with profile_gym_id) often have
-                        # biometric_type NULL. Upsert on (gym_id, essl_id, biometric_type, fid) does
-                        # not match NULL vs 'FACE', so merge into those rows by id first.
-                        ph_res = (
-                            sb.table('essl_biometrics')
-                            .select('id, essl_id, fid')
-                            .eq('gym_id', dev['gym_id'])
-                            .in_('essl_id', pin_list)
-                            .is_('biometric_type', 'null')
-                            .execute()
-                        )
-                        placeholder_by_pin_fid: Dict[Tuple[str, int], str] = {}
-                        for row in ph_res.data or []:
-                            eid = str(row.get('essl_id', '')).strip()
-                            fid_v = row.get('fid')
-                            if eid and fid_v is not None:
-                                placeholder_by_pin_fid[(eid, int(fid_v))] = row['id']
-
-                        merge_by_id: List[Dict[str, Any]] = []
-                        upsert_rest: List[Dict[str, Any]] = []
-                        for b in final_insert_data:
-                            key = (str(b['essl_id']).strip(), int(b['fid']))
-                            pid = placeholder_by_pin_fid.get(key)
-                            if pid:
-                                merge_by_id.append({**b, 'id': pid})
-                            else:
-                                upsert_rest.append(b)
-
-                        if merge_by_id:
-                            sb.table('essl_biometrics').upsert(
-                                merge_by_id,
-                                on_conflict='id',
-                            ).execute()
-                        if upsert_rest:
-                            sb.table('essl_biometrics').upsert(
-                                upsert_rest,
-                                on_conflict='gym_id,essl_id,biometric_type,fid',
-                            ).execute()
-                        print(
-                            f'[iclock/cdata {table}] saved {len(final_insert_data)} template(s) '
-                            f'(merge_by_id={len(merge_by_id)}, upsert={len(upsert_rest)})'
+                        save_essl_biometric_templates(
+                            sb, dev['gym_id'], table, biometrics_to_insert
                         )
                     except APIError as insert_error:
                         print(f'[iclock/cdata {table}] upsert failed:', insert_error)
@@ -685,6 +811,83 @@ def handle_iclock_cdata_post() -> Response:
         print(f'[iclock/cdata POST] USERINFO bulk sync, bodyLength={len(raw_data)}')
     elif table == 'OPERLOG':
         print(f'[iclock/cdata POST] OPERLOG, sn={sn!r}, bodyLength={len(raw_data)}')
+        if not sb:
+            print('[iclock/cdata OPERLOG] Supabase not configured; skipping DB work')
+            return text_response('OK')
+        try:
+            res = (
+                sb.table('gym_devices')
+                .select('gym_id')
+                .eq('serial_number', sn)
+                .execute()
+            )
+            drows = res.data or []
+            if len(drows) != 1:
+                print('[iclock/cdata OPERLOG] unknown device SN, cannot save FP', {
+                    'sn': sn,
+                    'rowCount': len(drows),
+                })
+                return text_response('OK')
+            gym_id = drows[0]['gym_id']
+
+            biometrics_to_insert: List[Dict[str, Any]] = []
+            for line in raw_data.split('\n'):
+                line = line.rstrip('\r')
+                if not line.strip():
+                    continue
+                fp_line = preprocess_operlog_fp_line(line)
+                if fp_line is None:
+                    continue
+                bio_obj = parse_iclock_kv_line(fp_line)
+                if not (bio_obj.get('PIN') and bio_obj.get('TMP')):
+                    continue
+                pin = bio_obj['PIN'].strip()
+                fid_raw = bio_obj.get('FID') or bio_obj.get('INDEX') or '0'
+                try:
+                    fid = int(fid_raw, 10)
+                except ValueError:
+                    fid = 0
+                try:
+                    size = int(bio_obj.get('SIZE') or '0', 10)
+                except ValueError:
+                    size = 0
+                if size == 0 and bio_obj.get('TMP'):
+                    size = len(bio_obj['TMP'])
+                try:
+                    valid = int(bio_obj.get('VALID') or '1', 10)
+                except ValueError:
+                    valid = 1
+                # OPERLOG FP has no Type; ZK BIODATA Type 0 = fingerprint (9 = face).
+                biometrics_to_insert.append({
+                    'gym_id': gym_id,
+                    'essl_id': pin,
+                    'biometric_type': 'FINGERPRINT',
+                    'fid': fid,
+                    'size': size,
+                    'valid': valid,
+                    'tmp': bio_obj['TMP'],
+                    'user_id': None,
+                    'essl_enabled': True,
+                    'type': 0,
+                    'major_ver': 0,
+                    'minor_ver': 0,
+                    'format': 0,
+                })
+
+            if biometrics_to_insert:
+                try:
+                    save_essl_biometric_templates(
+                        sb, gym_id, 'OPERLOG', biometrics_to_insert
+                    )
+                    queue_fingerprint_biodata_updates(
+                        sb, gym_id, sn, biometrics_to_insert
+                    )
+                except APIError as insert_error:
+                    print('[iclock/cdata OPERLOG] upsert failed:', insert_error)
+            else:
+                print('[iclock/cdata OPERLOG] no FP PIN/TMP lines to save')
+        except Exception as err:
+            print('[iclock/cdata OPERLOG] exception:', err)
         return text_response('OK')
     else:
         print('[iclock/cdata POST] unhandled or missing table param', {
