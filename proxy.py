@@ -142,33 +142,28 @@ def fetch_essl_biometrics_for_pins(
     return rows, err
 
 
-def build_fingerprint_biodata_update_command(entry: Dict[str, Any]) -> str:
-    """ZK DATA UPDATE BIODATA for a fingerprint template (Index = FID)."""
+# Stored on OPERLOG FP rows for schema compatibility; FINGERTMP download does not use them.
+FP_BIODATA_TYPE = 0
+FP_BIODATA_MAJOR_VER = 10
+FP_BIODATA_MINOR_VER = 0
+FP_BIODATA_FORMAT = 0
+
+
+def build_fingerprint_fingertmp_update_command(entry: Dict[str, Any]) -> str:
+    """Mirror OPERLOG FP upload format for download (devices that reject BIODATA)."""
     pin = entry['essl_id']
     fid = int(entry['fid'])
     valid = int(entry.get('valid') if entry.get('valid') is not None else 1)
-    size = int(entry.get('size') or 0)
     tmp = entry['tmp']
-    bio_type = entry.get('type')
-    if bio_type is None:
-        bio_type = 0
-    major_ver = entry.get('major_ver')
-    if major_ver is None:
-        major_ver = 0
-    minor_ver = entry.get('minor_ver')
-    if minor_ver is None:
-        minor_ver = 0
-    fmt = entry.get('format')
-    if fmt is None:
-        fmt = 0
+    size = int(entry.get('size') or 0)
+    if size == 0 and tmp:
+        size = len(tmp)
     return (
-        f'DATA UPDATE BIODATA\tPin={pin}\tNo=0\tIndex={fid}\tValid={valid}\t'
-        f'Duress=0\tType={bio_type}\tMajorVer={major_ver}\tMinorVer={minor_ver}\t'
-        f'Format={fmt}\tSize={size}\tTmp={tmp}'
+        f'DATA UPDATE FINGERTMP PIN={pin}\tFID={fid}\tSize={size}\tValid={valid}\tTMP={tmp}'
     )
 
 
-def queue_fingerprint_biodata_updates(
+def queue_fingerprint_fingertmp_updates(
     supabase: Client,
     gym_id: str,
     source_sn: str,
@@ -192,7 +187,7 @@ def queue_fingerprint_biodata_updates(
         ]
         if not target_sns:
             print(
-                '[iclock/cdata OPERLOG] no other gym devices for BIODATA sync',
+                '[iclock/cdata OPERLOG] no other gym devices for FINGERTMP sync',
                 {'gymId': gym_id, 'sourceSn': source_sn, 'templateCount': len(templates)},
             )
             return
@@ -203,14 +198,15 @@ def queue_fingerprint_biodata_updates(
                 rows.append({
                     'gym_id': gym_id,
                     'device_sn': sn,
-                    'command_string': build_fingerprint_biodata_update_command(entry),
+                    'command_string': build_fingerprint_fingertmp_update_command(entry),
                     'status': 'pending',
+                    # Same delay as face biodata so USERINFO is sent first.
                     'is_biodata': True,
                 })
         if rows:
             supabase.table('device_commands').insert(rows).execute()
             print(
-                '[iclock/cdata OPERLOG] queued DATA UPDATE BIODATA',
+                '[iclock/cdata OPERLOG] queued DATA UPDATE FINGERTMP',
                 {
                     'gymId': gym_id,
                     'sourceSn': source_sn,
@@ -219,9 +215,9 @@ def queue_fingerprint_biodata_updates(
                 },
             )
     except APIError as err:
-        print('[iclock/cdata OPERLOG] queue BIODATA commands failed:', err)
+        print('[iclock/cdata OPERLOG] queue FINGERTMP commands failed:', err)
     except Exception as err:
-        print('[iclock/cdata OPERLOG] queue BIODATA commands exception:', err)
+        print('[iclock/cdata OPERLOG] queue FINGERTMP commands exception:', err)
 
 
 def save_essl_biometric_templates(
@@ -857,7 +853,7 @@ def handle_iclock_cdata_post() -> Response:
                     valid = int(bio_obj.get('VALID') or '1', 10)
                 except ValueError:
                     valid = 1
-                # OPERLOG FP has no Type; ZK BIODATA Type 0 = fingerprint (9 = face).
+                # OPERLOG FP has no Type/MajorVer; use VX10 fingerprint biodata defaults.
                 biometrics_to_insert.append({
                     'gym_id': gym_id,
                     'essl_id': pin,
@@ -868,10 +864,10 @@ def handle_iclock_cdata_post() -> Response:
                     'tmp': bio_obj['TMP'],
                     'user_id': None,
                     'essl_enabled': True,
-                    'type': 0,
-                    'major_ver': 0,
-                    'minor_ver': 0,
-                    'format': 0,
+                    'type': FP_BIODATA_TYPE,
+                    'major_ver': FP_BIODATA_MAJOR_VER,
+                    'minor_ver': FP_BIODATA_MINOR_VER,
+                    'format': FP_BIODATA_FORMAT,
                 })
 
             if biometrics_to_insert:
@@ -879,7 +875,7 @@ def handle_iclock_cdata_post() -> Response:
                     save_essl_biometric_templates(
                         sb, gym_id, 'OPERLOG', biometrics_to_insert
                     )
-                    queue_fingerprint_biodata_updates(
+                    queue_fingerprint_fingertmp_updates(
                         sb, gym_id, sn, biometrics_to_insert
                     )
                 except APIError as insert_error:
