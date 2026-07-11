@@ -225,24 +225,61 @@ def save_essl_biometric_templates(
     gym_id: str,
     table_label: str,
     biometrics_to_insert: List[Dict[str, Any]],
-) -> int:
-    """Resolve user_id, merge placeholders, upsert templates. Returns saved count."""
+) -> List[Dict[str, Any]]:
+    """Merge/upsert templates only for PINs already linked to a member.
+
+    Skips device PINs with no existing essl_biometrics row that has user_id or
+    profile_gym_id (avoids orphan inserts). Dashboard enrollment placeholders
+    still receive templates via merge-by-id / upsert.
+
+    Returns the templates that were saved (for follow-on device_commands).
+    """
     if not biometrics_to_insert:
-        return 0
+        return []
 
     pin_list = list({str(b['essl_id']).strip() for b in biometrics_to_insert if b.get('essl_id')})
     users_info, _ = fetch_essl_biometrics_for_pins(supabase, gym_id, pin_list)
+
+    known_member_pins: Set[str] = set()
     user_map: Dict[str, str] = {}
+    profile_gym_map: Dict[str, str] = {}
     if users_info:
         for u in users_info:
+            eid = str(u.get('essl_id', '')).strip()
+            if not eid:
+                continue
             uid = u.get('user_id')
-            if uid:
-                user_map[str(u.get('essl_id', '')).strip()] = uid
+            pgid = u.get('profile_gym_id')
+            if uid or pgid:
+                known_member_pins.add(eid)
+            if uid and eid not in user_map:
+                user_map[eid] = uid
+            if pgid and eid not in profile_gym_map:
+                profile_gym_map[eid] = pgid
 
-    final_insert_data = [
-        {**b, 'user_id': user_map.get(b['essl_id'])}
-        for b in biometrics_to_insert
-    ]
+    allowed: List[Dict[str, Any]] = []
+    skipped_pins: List[str] = []
+    for b in biometrics_to_insert:
+        eid = str(b.get('essl_id', '')).strip()
+        if eid in known_member_pins:
+            allowed.append({
+                **b,
+                'user_id': user_map.get(eid) or b.get('user_id'),
+                'profile_gym_id': profile_gym_map.get(eid) or b.get('profile_gym_id'),
+            })
+        else:
+            skipped_pins.append(eid)
+
+    if skipped_pins:
+        print(f'[iclock/cdata {table_label}] skip orphan PIN(s) (no member-linked row)', {
+            'skippedPins': sorted(set(skipped_pins)),
+            'count': len(skipped_pins),
+        })
+
+    if not allowed:
+        return []
+
+    allowed_pins = list({str(b['essl_id']).strip() for b in allowed})
 
     # Placeholder rows (e.g. profile-linked) often have biometric_type NULL. Upsert on
     # (gym_id, essl_id, biometric_type, fid) does not match NULL vs 'FINGERPRINT'/'FACE'.
@@ -250,7 +287,7 @@ def save_essl_biometric_templates(
         supabase.table('essl_biometrics')
         .select('id, essl_id, fid')
         .eq('gym_id', gym_id)
-        .in_('essl_id', pin_list)
+        .in_('essl_id', allowed_pins)
         .is_('biometric_type', 'null')
         .execute()
     )
@@ -270,7 +307,7 @@ def save_essl_biometric_templates(
     merge_by_id: List[Dict[str, Any]] = []
     upsert_rest: List[Dict[str, Any]] = []
     used_placeholder_ids: Set[str] = set()
-    for b in final_insert_data:
+    for b in allowed:
         eid = str(b['essl_id']).strip()
         key = (eid, int(b['fid']))
         pid = placeholder_by_pin_fid.get(key)
@@ -293,10 +330,11 @@ def save_essl_biometric_templates(
             on_conflict='gym_id,essl_id,biometric_type,fid',
         ).execute()
     print(
-        f'[iclock/cdata {table_label}] saved {len(final_insert_data)} template(s) '
-        f'(merge_by_id={len(merge_by_id)}, upsert={len(upsert_rest)})'
+        f'[iclock/cdata {table_label}] saved {len(allowed)} template(s) '
+        f'(merge_by_id={len(merge_by_id)}, upsert={len(upsert_rest)}, '
+        f'skipped_orphans={len(skipped_pins)})'
     )
-    return len(final_insert_data)
+    return allowed
 
 
 def punch_timestamp_to_iso(timestamp: Optional[str]) -> Optional[str]:
@@ -872,12 +910,13 @@ def handle_iclock_cdata_post() -> Response:
 
             if biometrics_to_insert:
                 try:
-                    save_essl_biometric_templates(
+                    saved = save_essl_biometric_templates(
                         sb, gym_id, 'OPERLOG', biometrics_to_insert
                     )
-                    queue_fingerprint_fingertmp_updates(
-                        sb, gym_id, sn, biometrics_to_insert
-                    )
+                    if saved:
+                        queue_fingerprint_fingertmp_updates(
+                            sb, gym_id, sn, saved
+                        )
                 except APIError as insert_error:
                     print('[iclock/cdata OPERLOG] upsert failed:', insert_error)
             else:
