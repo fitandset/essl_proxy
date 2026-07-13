@@ -126,7 +126,7 @@ def fetch_essl_biometrics_for_pins(
         try:
             q = (
                 supabase.table('essl_biometrics')
-                .select('id, essl_id, user_id, profile_gym_id')
+                .select('id, essl_id, user_id, profile_gym_id, staff_id')
                 .eq('gym_id', gym_id)
                 .in_('essl_id', ids)
                 .execute()
@@ -226,11 +226,11 @@ def save_essl_biometric_templates(
     table_label: str,
     biometrics_to_insert: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Merge/upsert templates only for PINs already linked to a member.
+    """Merge/upsert templates only for PINs already linked to a person.
 
-    Skips device PINs with no existing essl_biometrics row that has user_id or
-    profile_gym_id (avoids orphan inserts). Dashboard enrollment placeholders
-    still receive templates via merge-by-id / upsert.
+    Skips device PINs with no existing essl_biometrics row that has user_id,
+    profile_gym_id, or staff_id (avoids orphan inserts). Dashboard enrollment
+    placeholders still receive templates via merge-by-id / upsert.
 
     Returns the templates that were saved (for follow-on device_commands).
     """
@@ -240,9 +240,10 @@ def save_essl_biometric_templates(
     pin_list = list({str(b['essl_id']).strip() for b in biometrics_to_insert if b.get('essl_id')})
     users_info, _ = fetch_essl_biometrics_for_pins(supabase, gym_id, pin_list)
 
-    known_member_pins: Set[str] = set()
+    known_person_pins: Set[str] = set()
     user_map: Dict[str, str] = {}
     profile_gym_map: Dict[str, str] = {}
+    staff_map: Dict[str, str] = {}
     if users_info:
         for u in users_info:
             eid = str(u.get('essl_id', '')).strip()
@@ -250,28 +251,32 @@ def save_essl_biometric_templates(
                 continue
             uid = u.get('user_id')
             pgid = u.get('profile_gym_id')
-            if uid or pgid:
-                known_member_pins.add(eid)
+            sid = u.get('staff_id')
+            if uid or pgid or sid:
+                known_person_pins.add(eid)
             if uid and eid not in user_map:
                 user_map[eid] = uid
             if pgid and eid not in profile_gym_map:
                 profile_gym_map[eid] = pgid
+            if sid and eid not in staff_map:
+                staff_map[eid] = sid
 
     allowed: List[Dict[str, Any]] = []
     skipped_pins: List[str] = []
     for b in biometrics_to_insert:
         eid = str(b.get('essl_id', '')).strip()
-        if eid in known_member_pins:
+        if eid in known_person_pins:
             allowed.append({
                 **b,
                 'user_id': user_map.get(eid) or b.get('user_id'),
                 'profile_gym_id': profile_gym_map.get(eid) or b.get('profile_gym_id'),
+                'staff_id': staff_map.get(eid) or b.get('staff_id'),
             })
         else:
             skipped_pins.append(eid)
 
     if skipped_pins:
-        print(f'[iclock/cdata {table_label}] skip orphan PIN(s) (no member-linked row)', {
+        print(f'[iclock/cdata {table_label}] skip orphan PIN(s) (no person-linked row)', {
             'skippedPins': sorted(set(skipped_pins)),
             'count': len(skipped_pins),
         })
@@ -453,7 +458,7 @@ def handle_iclock_cdata_get() -> Response:
 
 
 def _attendance_dedupe_key(log: Dict[str, Any]) -> tuple:
-    """(gym_id, device_id, person): person is user_id when set, else profile_gym_id."""
+    """(gym_id, device_id, person): user_id, else profile_gym_id, else staff_id, else essl_id."""
     gym_id = log.get('gym_id')
     device_id = log.get('device_id')
     uid = log.get('user_id')
@@ -464,8 +469,12 @@ def _attendance_dedupe_key(log: Dict[str, Any]) -> tuple:
         if pgid is not None and str(pgid).strip():
             person = ('profile', str(pgid))
         else:
-            eid = (log.get('essl_id') or '').strip() or f'__no_id_{uuid.uuid4()}'
-            person = ('essl', eid)
+            sid = log.get('staff_id')
+            if sid is not None and str(sid).strip():
+                person = ('staff', str(sid))
+            else:
+                eid = (log.get('essl_id') or '').strip() or f'__no_id_{uuid.uuid4()}'
+                person = ('essl', eid)
     return (gym_id, device_id, person)
 
 
@@ -510,11 +519,13 @@ def _attendance_row_for_rpc(row: Dict[str, Any]) -> Dict[str, Any]:
     """JSON-serializable payload for insert_attendance_logs_deduped_batch (Supabase RPC)."""
     uid = row.get('user_id')
     pgid = row.get('profile_gym_id')
+    sid = row.get('staff_id')
     return {
         'gym_id': str(row['gym_id']),
         'device_id': str(row['device_id']),
         'user_id': str(uid) if uid is not None and str(uid).strip() else None,
         'profile_gym_id': str(pgid) if pgid is not None and str(pgid).strip() else None,
+        'staff_id': str(sid) if sid is not None and str(sid).strip() else None,
         'essl_id': row.get('essl_id'),
         'punch_time': row['punch_time'],
         'punch_type': row['punch_type'],
@@ -657,6 +668,7 @@ def handle_iclock_cdata_post() -> Response:
                         bio_by_essl_id[key] = {
                             'user_id': u.get('user_id'),
                             'profile_gym_id': u.get('profile_gym_id'),
+                            'staff_id': u.get('staff_id'),
                         }
 
                 logs_to_insert: List[Dict[str, Any]] = []
@@ -666,8 +678,8 @@ def handle_iclock_cdata_post() -> Response:
                     eid = (punch.get('esslId') or '').strip()
                     resolved = bio_by_essl_id.get(eid) if eid else None
                     r = resolved or {}
-                    # Only persist when essl_biometrics maps to user (profile) or profile_gym
-                    if not (r.get('user_id') or r.get('profile_gym_id')):
+                    # Persist when essl_biometrics maps to member or staff
+                    if not (r.get('user_id') or r.get('profile_gym_id') or r.get('staff_id')):
                         skipped_no_profile += 1
                         continue
                     logs_to_insert.append({
@@ -675,6 +687,7 @@ def handle_iclock_cdata_post() -> Response:
                         'device_id': device['id'],
                         'user_id': r.get('user_id'),
                         'profile_gym_id': r.get('profile_gym_id'),
+                        'staff_id': r.get('staff_id'),
                         'essl_id': eid or None,
                         'punch_time': punch_time,
                         'punch_type': get_punch_type(punch['status']),
@@ -685,7 +698,7 @@ def handle_iclock_cdata_post() -> Response:
                     })
 
                 if skipped_no_profile > 0:
-                    print('[iclock/cdata ATTLOG] skipped punches (no user_id or profile_gym_id)', {
+                    print('[iclock/cdata ATTLOG] skipped punches (no user_id, profile_gym_id, or staff_id)', {
                         'skippedNoProfile': skipped_no_profile,
                     })
 
