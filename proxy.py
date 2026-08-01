@@ -364,6 +364,12 @@ def punch_timestamp_to_iso(timestamp: Optional[str]) -> Optional[str]:
 
 
 BIODATA_COMMAND_SEND_DELAY_SEC = 20
+# Reclaim only rows with sent_at set (post-migration). Historical sent (sent_at NULL) stay untouched.
+SENT_ACK_TIMEOUT_SEC = int(os.environ.get('ESSL_SENT_ACK_TIMEOUT_SEC', '300'))
+MAX_COMMAND_RETRIES = int(os.environ.get('ESSL_MAX_COMMAND_RETRIES', '3'))
+
+# When False (migration not applied), skip sent_at / retry_count / auto-reclaim; ACK→completed still attempted.
+_DEVICE_CMD_TRACKING_ENABLED = True
 
 
 def _parse_device_command_created_at(created_at: Any) -> Optional[datetime]:
@@ -390,6 +396,206 @@ def _device_command_ready_to_send(command: Dict[str, Any], now: datetime) -> boo
     if dt is None:
         return True
     return now >= dt + timedelta(seconds=BIODATA_COMMAND_SEND_DELAY_SEC)
+
+
+def _api_error_mentions_missing_column(err: BaseException) -> bool:
+    """True only when PostgREST/Postgres complains about our new tracking columns."""
+    msg = str(err).lower()
+    col_hit = 'sent_at' in msg or 'retry_count' in msg
+    if not col_hit:
+        return False
+    return (
+        'does not exist' in msg
+        or 'could not find' in msg
+        or 'schema cache' in msg
+        or '42703' in msg
+        or 'pgrst204' in msg
+    )
+
+
+def _mark_device_command_sent(sb: Client, command_id: int) -> None:
+    """Mark command sent; set sent_at when tracking columns exist."""
+    global _DEVICE_CMD_TRACKING_ENABLED
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if _DEVICE_CMD_TRACKING_ENABLED:
+        try:
+            sb.table('device_commands').update({
+                'status': 'sent',
+                'sent_at': now_iso,
+            }).eq('id', command_id).execute()
+            return
+        except APIError as err:
+            if _api_error_mentions_missing_column(err):
+                print(
+                    '[iclock] device_commands.sent_at missing — run migration '
+                    '20260801_device_commands_sent_at_retry.sql; falling back'
+                )
+                _DEVICE_CMD_TRACKING_ENABLED = False
+            else:
+                raise
+    sb.table('device_commands').update({'status': 'sent'}).eq('id', command_id).execute()
+
+
+def reclaim_stale_sent_commands(sb: Client, sn: str) -> None:
+    """
+    Re-queue commands that were handed to the device but never ACKed.
+    Only touches rows with sent_at IS NOT NULL (never re-floods pre-migration history).
+    """
+    global _DEVICE_CMD_TRACKING_ENABLED
+    if not _DEVICE_CMD_TRACKING_ENABLED or not sn:
+        return
+    try:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=SENT_ACK_TIMEOUT_SEC)
+        ).isoformat()
+        res = (
+            sb.table('device_commands')
+            .select('id, retry_count, sent_at')
+            .eq('device_sn', sn)
+            .eq('status', 'sent')
+            .not_.is_('sent_at', 'null')
+            .lt('sent_at', cutoff)
+            .order('id', desc=False)
+            .limit(50)
+            .execute()
+        )
+        rows = res.data or []
+        for row in rows:
+            cmd_id = row.get('id')
+            if cmd_id is None:
+                continue
+            retries = int(row.get('retry_count') or 0)
+            if retries >= MAX_COMMAND_RETRIES:
+                sb.table('device_commands').update({
+                    'status': 'error',
+                }).eq('id', cmd_id).eq('status', 'sent').execute()
+                print(
+                    f'[iclock] command {cmd_id} SN={sn} exceeded {MAX_COMMAND_RETRIES} '
+                    f'retries after no ACK → error'
+                )
+                continue
+            sb.table('device_commands').update({
+                'status': 'pending',
+                'retry_count': retries + 1,
+                'sent_at': None,
+            }).eq('id', cmd_id).eq('status', 'sent').execute()
+            print(
+                f'[iclock] reclaimed command {cmd_id} SN={sn} → pending '
+                f'(retry {retries + 1}/{MAX_COMMAND_RETRIES}, no ACK within '
+                f'{SENT_ACK_TIMEOUT_SEC}s)'
+            )
+    except APIError as err:
+        if _api_error_mentions_missing_column(err):
+            print(
+                '[iclock] reclaim skipped — device_commands.sent_at/retry_count missing; '
+                'run migration 20260801_device_commands_sent_at_retry.sql'
+            )
+            _DEVICE_CMD_TRACKING_ENABLED = False
+        else:
+            print('[iclock] reclaim_stale_sent_commands error:', err)
+    except Exception as err:
+        print('[iclock] reclaim_stale_sent_commands exception:', err)
+
+
+def parse_devicecmd_acks(raw: str) -> List[Tuple[int, int]]:
+    """Parse ZK/ADMS ACK body lines like ID=123&Return=0 (Return=0 means success)."""
+    results: List[Tuple[int, int]] = []
+    if not raw or not str(raw).strip():
+        return results
+    text = str(raw).strip()
+    chunks = re.split(r'[\r\n]+', text)
+    if len(chunks) == 1 and ('ID=' in text.upper() or 'ID =' in text.upper()):
+        # Some firmwares POST one long query-string without newlines.
+        chunks = re.split(r'(?=(?:^|[&\s])ID\s*=)', text, flags=re.IGNORECASE)
+    for chunk in chunks:
+        chunk = chunk.strip().strip('&')
+        if not chunk:
+            continue
+        id_m = re.search(r'(?:^|[&\s;])ID\s*=\s*(\d+)', chunk, re.IGNORECASE)
+        if not id_m:
+            id_m = re.search(r'^ID\s*=\s*(\d+)', chunk, re.IGNORECASE)
+        ret_m = re.search(r'(?:^|[&\s;])Return\s*=\s*(-?\d+)', chunk, re.IGNORECASE)
+        if id_m and ret_m:
+            results.append((int(id_m.group(1)), int(ret_m.group(1))))
+    return results
+
+
+def apply_devicecmd_acks(sb: Client, sn: Optional[str], acks: List[Tuple[int, int]]) -> None:
+    """Update device_commands from device ACK. Always leave device response as OK upstream."""
+    global _DEVICE_CMD_TRACKING_ENABLED
+    for cmd_id, return_code in acks:
+        try:
+            if return_code == 0:
+                payload: Dict[str, Any] = {'status': 'completed'}
+                if _DEVICE_CMD_TRACKING_ENABLED:
+                    # Clear sent_at so reclaim never touches completed rows.
+                    payload['sent_at'] = None
+                try:
+                    sb.table('device_commands').update(payload).eq('id', cmd_id).execute()
+                except APIError as err:
+                    if _api_error_mentions_missing_column(err) and 'sent_at' in payload:
+                        _DEVICE_CMD_TRACKING_ENABLED = False
+                        sb.table('device_commands').update(
+                            {'status': 'completed'}
+                        ).eq('id', cmd_id).execute()
+                    else:
+                        raise
+                print(
+                    f'[iclock/devicecmd] ACK OK id={cmd_id} SN={sn} Return={return_code} → completed'
+                )
+                continue
+
+            # Non-zero Return: retry if under cap and tracking enabled; else mark error.
+            retries = 0
+            if _DEVICE_CMD_TRACKING_ENABLED:
+                try:
+                    row_res = (
+                        sb.table('device_commands')
+                        .select('retry_count')
+                        .eq('id', cmd_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    rows = row_res.data or []
+                    if rows:
+                        retries = int(rows[0].get('retry_count') or 0)
+                except APIError as err:
+                    if _api_error_mentions_missing_column(err):
+                        _DEVICE_CMD_TRACKING_ENABLED = False
+                    else:
+                        raise
+
+            if _DEVICE_CMD_TRACKING_ENABLED and retries < MAX_COMMAND_RETRIES:
+                sb.table('device_commands').update({
+                    'status': 'pending',
+                    'retry_count': retries + 1,
+                    'sent_at': None,
+                }).eq('id', cmd_id).execute()
+                print(
+                    f'[iclock/devicecmd] ACK FAIL id={cmd_id} SN={sn} Return={return_code} '
+                    f'→ pending (retry {retries + 1}/{MAX_COMMAND_RETRIES})'
+                )
+            else:
+                fail_payload: Dict[str, Any] = {'status': 'error'}
+                if _DEVICE_CMD_TRACKING_ENABLED:
+                    fail_payload['sent_at'] = None
+                try:
+                    sb.table('device_commands').update(fail_payload).eq('id', cmd_id).execute()
+                except APIError as err:
+                    if _api_error_mentions_missing_column(err):
+                        _DEVICE_CMD_TRACKING_ENABLED = False
+                        sb.table('device_commands').update(
+                            {'status': 'error'}
+                        ).eq('id', cmd_id).execute()
+                    else:
+                        raise
+                print(
+                    f'[iclock/devicecmd] ACK FAIL id={cmd_id} SN={sn} Return={return_code} → error'
+                )
+        except APIError as err:
+            print(f'[iclock/devicecmd] update failed id={cmd_id}:', err)
+        except Exception as err:
+            print(f'[iclock/devicecmd] update exception id={cmd_id}:', err)
 
 
 def handle_iclock_cdata_get() -> Response:
@@ -423,6 +629,9 @@ def handle_iclock_cdata_get() -> Response:
         except APIError as update_err:
             print('[iclock/cdata GET] gym_devices update error:', update_err)
 
+        # Reclaim unacked sends for this SN only (requires sent_at migration).
+        reclaim_stale_sent_commands(sb, sn)
+
         # Pending commands for this machine (by id). Biodata rows wait BIODATA_COMMAND_SEND_DELAY_SEC
         # after created_at so non-biodata commands (e.g. update user) ahead in the queue go first.
         try:
@@ -445,9 +654,7 @@ def handle_iclock_cdata_get() -> Response:
             if command:
                 formatted_command = f"C:{command['id']}:{command['command_string']}\n"
                 print(f'>>> SENDING COMMAND TO {sn}:', formatted_command.strip())
-                sb.table('device_commands').update({'status': 'sent'}).eq(
-                    'id', command['id']
-                ).execute()
+                _mark_device_command_sent(sb, int(command['id']))
                 return text_response(formatted_command)
         except APIError as cmd_err:
             print('[iclock/cdata GET] device_commands error:', cmd_err)
@@ -964,9 +1171,9 @@ def iclock_getrequest():
 @app.route('/iclock/devicecmd', methods=['POST'], strict_slashes=False)
 @app.route('/iclock/devicecmd.aspx', methods=['POST'], strict_slashes=False)
 def iclock_devicecmd():
-    """Device posts command execution results; acknowledge with OK (ZK / similar firmware)."""
+    """Device posts command execution results; parse ACK then always reply OK."""
     sn = request.args.get('SN')
-    raw_data = request.get_data(as_text=True)
+    raw_data = request.get_data(as_text=True) or ''
     raw_preview = (
         raw_data[:400]
         .replace('\t', '\\t')
@@ -976,6 +1183,17 @@ def iclock_devicecmd():
     if len(raw_data) > 400:
         raw_preview = f'{raw_preview}...'
     print(f'DEVICE CMD RESPONSE [{sn}]:', raw_preview)
+
+    acks = parse_devicecmd_acks(raw_data)
+    if acks:
+        print(f'[iclock/devicecmd] parsed {len(acks)} ACK(s) for SN={sn}: {acks}')
+        sb = get_supabase()
+        if sb:
+            apply_devicecmd_acks(sb, sn, acks)
+    else:
+        print(f'[iclock/devicecmd] no parseable ID/Return ACK for SN={sn}')
+
+    # Always OK so the device does not stop posting results.
     return text_response('OK')
 
 
