@@ -1,0 +1,11 @@
+.git
+__pycache__
+*.pyc
+.env
+whatsapp/node_modules
+whatsapp/.env
+whatsapp/dist
+whatsapp/auth
+*.log
+.dockerignore
+DOCKER.md

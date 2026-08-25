@@ -1,0 +1,14 @@
+# Local test only. Do not point live essl.fitandset.com at this until you have tested.
+services:
+  essl-whatsapp:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - whatsapp/.env
+    environment:
+      PORT: "8080"
+      ESSL_PORT: "10001"
+      WA_PORT: "3001"
+      BASE_PATH: "/wa"
+      LOG_LEVEL: warn
