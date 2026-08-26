@@ -195,7 +195,7 @@ async function createSocket(sessionId: string): Promise<WASocket> {
     qrTimeout: QR_TIMEOUT_MS,
     syncFullHistory: false,
     markOnlineOnConnect: false,
-    generateHighQualityLinkPreview: false,
+    generateHighQualityLinkPreview: true,
   });
 
   const socket = await wrapWithAntiban(rawSocket, sessionId);
