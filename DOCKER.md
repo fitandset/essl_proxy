@@ -37,6 +37,8 @@ Leave Render’s `PORT` as-is (often `10000`). Nginx binds that. Set these on th
 
 `start.sh` also refuses to let gunicorn/Node bind the same port as nginx if someone forgets `ESSL_PORT`.
 
+If WhatsApp Node exits, `start.sh` restarts **only Node** (5s delay). Gunicorn/ESSL keeps running. A full Render restart still recycles the whole container.
+
 ## Enquiry notify later
 
 Call `https://YOUR-HOST/wa/sessions/send` (not `/sessions/send` on the ESSL root).

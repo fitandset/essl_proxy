@@ -54,9 +54,17 @@ EOF
 
 gunicorn --bind "0.0.0.0:${ESSL_PORT}" --workers 1 --threads 4 --timeout 120 proxy:app &
 
-export PORT="${WA_PORT}"
-export BASE_PATH="${BASE_PATH:-/wa}"
-cd /app/whatsapp
-node dist/index.js &
+# Restart WhatsApp Node only. Gunicorn/ESSL is not in this loop.
+(
+  export PORT="${WA_PORT}"
+  export BASE_PATH="${BASE_PATH:-/wa}"
+  cd /app/whatsapp
+  while true; do
+    echo "start.sh: starting WhatsApp Node" >&2
+    node dist/index.js || echo "start.sh: WhatsApp Node exited ($?)" >&2
+    echo "start.sh: restarting WhatsApp Node in 5s" >&2
+    sleep 5
+  done
+) &
 
 nginx -g "daemon off;"
