@@ -52,7 +52,7 @@ server {
 }
 EOF
 
-gunicorn --bind "0.0.0.0:${ESSL_PORT}" --workers 1 --threads 4 --timeout 120 proxy:app &
+gunicorn --bind "0.0.0.0:${ESSL_PORT}" --workers 1 --threads 6 --timeout 120 proxy:app &
 
 # Restart WhatsApp Node only. Gunicorn/ESSL is not in this loop.
 (

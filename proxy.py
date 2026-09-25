@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from postgrest.exceptions import APIError
-from supabase import create_client, Client
+from supabase import Client, ClientOptions, create_client
 
 app = Flask(__name__)
 
@@ -23,7 +23,13 @@ def get_supabase() -> Optional[Client]:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         print('[iclock/cdata] SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing; DB ops skipped')
         return None
-    _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    # 10s so a stuck Supabase call releases the worker thread. Successful punches
+    # finish in well under a second, so this does not change normal punch or poll flow.
+    _supabase = create_client(
+        SUPABASE_URL,
+        SUPABASE_SERVICE_ROLE_KEY,
+        options=ClientOptions(postgrest_client_timeout=10),
+    )
     return _supabase
 
 
@@ -600,12 +606,6 @@ def apply_devicecmd_acks(sb: Client, sn: Optional[str], acks: List[Tuple[int, in
 
 def handle_iclock_cdata_get() -> Response:
     sn = request.args.get('SN')
-    table = request.args.get('table')
-    print('[iclock/cdata GET]', {
-        'sn': sn,
-        'table': table,
-        'note': 'GET is handshake only; ATTLOG body is ignored. Use POST for punch data.',
-    })
 
     sb = get_supabase()
     if sn and sb:
@@ -624,8 +624,6 @@ def handle_iclock_cdata_get() -> Response:
                 print(
                     f'[iclock/cdata GET] no gym_devices row matched serial_number={sn!r} (update skipped)'
                 )
-            else:
-                print('[iclock/cdata GET] gym_devices marked online, device id:', data[0].get('id'))
         except APIError as update_err:
             print('[iclock/cdata GET] gym_devices update error:', update_err)
 
@@ -1152,6 +1150,12 @@ def handle_iclock_cdata_post() -> Response:
         })
 
     return text_response('OK1')
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Render health check only. Does not touch Supabase or device state."""
+    return text_response('OK')
 
 
 @app.route('/iclock/cdata', methods=['GET', 'POST'], strict_slashes=False)
