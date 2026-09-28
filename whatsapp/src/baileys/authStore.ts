@@ -7,6 +7,7 @@ import {
 } from "@whiskeysockets/baileys";
 import fs from "node:fs/promises";
 import { antibanPersistPath } from "./antiban.js";
+import { stripPeerKeyBuckets } from "./decryptBackoff.js";
 import {
   clearSessionAuth,
   credsAreRegistered,
@@ -20,6 +21,13 @@ import {
 function emptyKeys(): BaileysKeyStore {
   return {};
 }
+
+interface ActiveKeyStore {
+  keys: BaileysKeyStore;
+  flushKeys: () => Promise<void>;
+}
+
+const activeKeyStores = new Map<string, ActiveKeyStore>();
 
 export async function useDatabaseAuthState(sessionId: string) {
   const row = await ensureSessionRow(sessionId);
@@ -44,6 +52,9 @@ export async function useDatabaseAuthState(sessionId: string) {
       void flushKeys().catch(() => undefined);
     }, 400);
   };
+
+  const active: ActiveKeyStore = { keys, flushKeys };
+  activeKeyStores.set(sessionId, active);
 
   return {
     state: {
@@ -99,6 +110,24 @@ export async function hasSavedAuth(sessionId: string): Promise<boolean> {
 }
 
 export async function clearAuth(sessionId: string): Promise<void> {
+  activeKeyStores.delete(sessionId);
   await clearSessionAuth(sessionId);
   await fs.unlink(antibanPersistPath(sessionId)).catch(() => undefined);
+}
+
+export async function stripPeerSessions(sessionId: string, jid: string): Promise<number> {
+  const active = activeKeyStores.get(sessionId);
+  if (!active) {
+    const row = await ensureSessionRow(sessionId);
+    const keys = fromDbJson<BaileysKeyStore>(row.keys) ?? emptyKeys();
+    const removed = stripPeerKeyBuckets(keys, jid);
+    if (removed > 0) {
+      await saveKeysToDb(sessionId, keys);
+    }
+    return removed;
+  }
+
+  const removed = stripPeerKeyBuckets(active.keys, jid);
+  await active.flushKeys();
+  return removed;
 }

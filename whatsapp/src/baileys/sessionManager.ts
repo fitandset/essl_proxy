@@ -6,7 +6,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
 import { config } from "../config.js";
-import { logger } from "../logger.js";
+import { logger, setErrorLogListener } from "../logger.js";
 import {
   SessionError,
   type SessionStatus,
@@ -20,7 +20,13 @@ import {
   stopAntibanPersistSync,
   wrapWithAntiban,
 } from "./antiban.js";
-import { clearAuth, hasSavedAuth, useDatabaseAuthState } from "./authStore.js";
+import { clearAuth, hasSavedAuth, stripPeerSessions, useDatabaseAuthState } from "./authStore.js";
+import {
+  DECRYPT_FAIL_THRESHOLD,
+  DECRYPT_FAIL_WINDOW_MS,
+  decryptLogSignal,
+  pauseAfterDecryptStorm,
+} from "./decryptBackoff.js";
 import { updateSessionMeta } from "./sessionRepository.js";
 
 const PAIR_CODE_TTL_MS = 90_000;
@@ -38,12 +44,212 @@ interface SocketState {
   stoppedByUser: boolean;
   pairingLock: Promise<string> | null;
   pairingSucceeded: boolean;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  decryptResumeTimer: ReturnType<typeof setTimeout> | null;
+  decryptStrikeResetTimer: ReturnType<typeof setTimeout> | null;
+  decryptRecovering: boolean;
+  decryptHoldUntil: number;
+  decryptStrikes: number;
+  decryptFailTimes: Map<string, number[]>;
+  lastDecryptJid: string | null;
 }
 
 const sockets = new Map<string, SocketState>();
+let consoleErrorPatched = false;
+let decryptNoticeTimer: ReturnType<typeof setTimeout> | null = null;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function clearTimer(timer: ReturnType<typeof setTimeout> | null): void {
+  if (timer) {
+    clearTimeout(timer);
+  }
+}
+
+function cancelReconnect(runtime: SocketState): void {
+  clearTimer(runtime.reconnectTimer);
+  runtime.reconnectTimer = null;
+}
+
+function cancelDecryptPause(runtime: SocketState, resetStrikes: boolean): void {
+  clearTimer(decryptNoticeTimer);
+  decryptNoticeTimer = null;
+  clearTimer(runtime.decryptResumeTimer);
+  clearTimer(runtime.decryptStrikeResetTimer);
+  runtime.decryptResumeTimer = null;
+  runtime.decryptStrikeResetTimer = null;
+  runtime.decryptRecovering = false;
+  runtime.decryptHoldUntil = 0;
+  runtime.decryptFailTimes.clear();
+  if (resetStrikes) {
+    runtime.decryptStrikes = 0;
+    runtime.lastDecryptJid = null;
+  }
+}
+
+function scheduleReconnect(sessionId: string, delayMs: number): void {
+  const runtime = getState(sessionId);
+  if (runtime.stoppedByUser || runtime.decryptHoldUntil > Date.now()) {
+    return;
+  }
+  cancelReconnect(runtime);
+  runtime.reconnectTimer = setTimeout(() => {
+    runtime.reconnectTimer = null;
+    if (runtime.stoppedByUser || runtime.decryptHoldUntil > Date.now()) {
+      return;
+    }
+    void startSession(sessionId, { isReconnect: true }).catch((error) => {
+      logger.error({ sessionId, error }, "Failed to reconnect WhatsApp session");
+    });
+  }, delayMs);
+}
+
+function armHealthyStrikeReset(sessionId: string): void {
+  const runtime = getState(sessionId);
+  clearTimer(runtime.decryptStrikeResetTimer);
+  runtime.decryptStrikeResetTimer = setTimeout(() => {
+    runtime.decryptStrikeResetTimer = null;
+    runtime.decryptStrikes = 0;
+    runtime.decryptFailTimes.clear();
+  }, 30 * 60 * 1000);
+  runtime.decryptStrikeResetTimer.unref?.();
+}
+
+async function beginDecryptRecovery(sessionId: string, jid: string | null): Promise<void> {
+  const runtime = getState(sessionId);
+  if (
+    runtime.decryptRecovering ||
+    runtime.decryptHoldUntil > Date.now() ||
+    runtime.stoppedByUser ||
+    runtime.status === "qr" ||
+    runtime.status === "pairing"
+  ) {
+    return;
+  }
+
+  runtime.decryptRecovering = true;
+  cancelReconnect(runtime);
+  clearTimer(runtime.decryptStrikeResetTimer);
+  runtime.decryptStrikeResetTimer = null;
+
+  const waitMs = pauseAfterDecryptStorm(runtime.decryptStrikes);
+  runtime.decryptStrikes += 1;
+  runtime.decryptHoldUntil = Date.now() + waitMs;
+  runtime.decryptFailTimes.clear();
+
+  const peerJid = jid ?? runtime.lastDecryptJid;
+  if (peerJid) {
+    try {
+      const removed = await stripPeerSessions(sessionId, peerJid);
+      logger.warn(
+        { sessionId, jid: peerJid, removed },
+        "Dropped encryption keys for the chat that failed to decrypt",
+      );
+    } catch (error) {
+      logger.error(
+        { sessionId, jid: peerJid, error },
+        "Failed to drop broken chat encryption keys",
+      );
+    }
+  }
+
+  logger.warn(
+    { sessionId, jid: peerJid, waitMs, strikes: runtime.decryptStrikes },
+    "Pausing WhatsApp after decrypt failures so it does not keep downloading",
+  );
+
+  const socket = runtime.socket;
+  runtime.socket = null;
+  runtime.status = "disconnected";
+  runtime.qrDataUrl = null;
+  runtime.pairingCode = null;
+  runtime.pairingIssuedAt = null;
+  stopAntibanPersistSync(sessionId);
+  void flushAntibanPersist(sessionId);
+  void updateSessionMeta(sessionId, {
+    status: "disconnected",
+    qr_data_url: null,
+  });
+
+  if (socket) {
+    socket.end(undefined);
+  }
+
+  if (peerJid) {
+    await stripPeerSessions(sessionId, peerJid).catch(() => undefined);
+  }
+
+  clearTimer(runtime.decryptResumeTimer);
+  runtime.decryptResumeTimer = setTimeout(() => {
+    runtime.decryptResumeTimer = null;
+    runtime.decryptRecovering = false;
+    runtime.decryptHoldUntil = 0;
+    if (runtime.stoppedByUser) {
+      return;
+    }
+    logger.info({ sessionId, waitMs }, "Resuming WhatsApp after decrypt pause");
+    void startSession(sessionId, { isReconnect: true }).catch((error) => {
+      logger.error({ sessionId, error }, "Failed to resume WhatsApp after decrypt pause");
+    });
+  }, waitMs);
+  runtime.decryptResumeTimer.unref?.();
+}
+
+function noteDecryptLog(sessionId: string, args: unknown[]): void {
+  const signal = decryptLogSignal(args);
+  if (!signal) {
+    return;
+  }
+
+  const runtime = getState(sessionId);
+  if (signal.jid) {
+    runtime.lastDecryptJid = signal.jid;
+  }
+  if (
+    runtime.decryptRecovering ||
+    runtime.decryptHoldUntil > Date.now() ||
+    runtime.stoppedByUser
+  ) {
+    return;
+  }
+
+  const jid = signal.jid ?? runtime.lastDecryptJid ?? "unknown";
+  const now = Date.now();
+  const recent = (runtime.decryptFailTimes.get(jid) ?? []).filter(
+    (timestamp) => now - timestamp < DECRYPT_FAIL_WINDOW_MS,
+  );
+  recent.push(now);
+  runtime.decryptFailTimes.set(jid, recent);
+
+  if (!signal.immediate && recent.length < DECRYPT_FAIL_THRESHOLD) {
+    return;
+  }
+
+  if (decryptNoticeTimer) {
+    return;
+  }
+  decryptNoticeTimer = setTimeout(() => {
+    decryptNoticeTimer = null;
+    void beginDecryptRecovery(sessionId, getState(sessionId).lastDecryptJid);
+  }, 150);
+}
+
+function installDecryptWatch(sessionId: string): void {
+  setErrorLogListener((args) => {
+    noteDecryptLog(sessionId, args);
+  });
+
+  if (consoleErrorPatched) {
+    return;
+  }
+  consoleErrorPatched = true;
+  const original = console.error.bind(console);
+  console.error = (...args: unknown[]) => {
+    noteDecryptLog(sessionId, args);
+    original(...args);
+  };
 }
 
 export function normalizePairingPhone(input: string): string {
@@ -76,6 +282,14 @@ function getState(sessionId: string): SocketState {
       stoppedByUser: false,
       pairingLock: null,
       pairingSucceeded: false,
+      reconnectTimer: null,
+      decryptResumeTimer: null,
+      decryptStrikeResetTimer: null,
+      decryptRecovering: false,
+      decryptHoldUntil: 0,
+      decryptStrikes: 0,
+      decryptFailTimes: new Map(),
+      lastDecryptJid: null,
     };
     sockets.set(sessionId, state);
   }
@@ -225,6 +439,7 @@ async function waitForPairingReady(
 }
 
 async function createSocket(sessionId: string): Promise<WASocket> {
+  installDecryptWatch(sessionId);
   const { state, saveCreds } = await useDatabaseAuthState(sessionId);
   const { version } = await fetchLatestBaileysVersion();
   const runtime = getState(sessionId);
@@ -245,6 +460,7 @@ async function createSocket(sessionId: string): Promise<WASocket> {
     logger,
     qrTimeout: QR_TIMEOUT_MS,
     syncFullHistory: false,
+    shouldSyncHistoryMessage: () => false,
     markOnlineOnConnect: false,
     generateHighQualityLinkPreview: true,
   });
@@ -296,6 +512,7 @@ async function createSocket(sessionId: string): Promise<WASocket> {
         connected_at: new Date().toISOString(),
       });
       void flushAntibanPersist(sessionId);
+      armHealthyStrikeReset(sessionId);
 
       logger.info(
         { sessionId, phoneNumber: runtime.phoneNumber },
@@ -354,7 +571,7 @@ async function createSocket(sessionId: string): Promise<WASocket> {
         "WhatsApp session closed",
       );
 
-      if (runtime.stoppedByUser) {
+      if (runtime.stoppedByUser || runtime.decryptHoldUntil > Date.now()) {
         return;
       }
 
@@ -374,11 +591,7 @@ async function createSocket(sessionId: string): Promise<WASocket> {
       if (restartRequired || pairingJustSucceeded) {
         runtime.reconnectAttempts = 0;
         logger.info({ sessionId }, "Restart required — reconnecting with saved credentials");
-        setTimeout(() => {
-          void startSession(sessionId, { isReconnect: true }).catch((error) => {
-            logger.error({ sessionId, error }, "Failed to restart WhatsApp session");
-          });
-        }, 500);
+        scheduleReconnect(sessionId, 500);
         return;
       }
 
@@ -394,12 +607,7 @@ async function createSocket(sessionId: string): Promise<WASocket> {
 
       if (runtime.reconnectAttempts < 5) {
         runtime.reconnectAttempts += 1;
-        const delayMs = runtime.reconnectAttempts * 5000;
-        setTimeout(() => {
-          void startSession(sessionId, { isReconnect: true }).catch((error) => {
-            logger.error({ sessionId, error }, "Failed to reconnect WhatsApp session");
-          });
-        }, delayMs);
+        scheduleReconnect(sessionId, runtime.reconnectAttempts * 5000);
       }
     }
   });
@@ -416,6 +624,9 @@ export async function startSession(
   if (!options?.isReconnect) {
     runtime.stoppedByUser = false;
     runtime.reconnectAttempts = 0;
+    cancelDecryptPause(runtime, true);
+  } else if (runtime.decryptHoldUntil > Date.now()) {
+    return;
   }
 
   if (runtime.socket && runtime.status === "connected") {
@@ -452,6 +663,7 @@ async function requestPairingCode(
 
   runtime.stoppedByUser = false;
   runtime.reconnectAttempts = 0;
+  cancelDecryptPause(runtime, true);
 
   if (!runtime.socket) {
     await createSocket(sessionId);
@@ -516,6 +728,8 @@ export async function stopSession(
 ): Promise<void> {
   const runtime = getState(sessionId);
   runtime.stoppedByUser = true;
+  cancelReconnect(runtime);
+  cancelDecryptPause(runtime, true);
   stopAntibanPersistSync(sessionId);
   await flushAntibanPersist(sessionId);
 
@@ -539,6 +753,8 @@ export async function logoutSession(
 ): Promise<void> {
   const runtime = getState(sessionId);
   runtime.stoppedByUser = true;
+  cancelReconnect(runtime);
+  cancelDecryptPause(runtime, true);
   stopAntibanPersistSync(sessionId);
 
   if (runtime.socket) {
