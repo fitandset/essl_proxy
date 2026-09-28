@@ -144,6 +144,57 @@ export async function sendTextMessage(
   return { phone, jid };
 }
 
+export async function sendGroupTextMessage(
+  groupName: string,
+  text: string,
+  sessionId = config.defaultSessionId,
+): Promise<{ groupName: string; jid: string }> {
+  const name = groupName.trim();
+  const trimmed = text.trim();
+  if (!name) {
+    throw new SessionError("Group name is required", 400);
+  }
+  if (!trimmed) {
+    throw new SessionError("Message text is required", 400);
+  }
+
+  const runtime = getState(sessionId);
+  if (!runtime.socket || runtime.status !== "connected") {
+    throw new SessionError(
+      "WhatsApp is not connected. Link the number first, then send.",
+      409,
+    );
+  }
+
+  const groups = await runtime.socket.groupFetchAllParticipating();
+  const matches = Object.values(groups).filter((group) => group.subject?.trim() === name);
+  if (matches.length === 0) {
+    throw new SessionError(
+      `WhatsApp group "${name}" was not found on the connected number.`,
+      404,
+    );
+  }
+  if (matches.length > 1) {
+    throw new SessionError(`More than one WhatsApp group is named "${name}".`, 409);
+  }
+
+  const jid = matches[0].id;
+
+  try {
+    await runtime.socket.sendPresenceUpdate("composing", jid).catch(() => undefined);
+    await runtime.socket.sendMessage(jid, { text: trimmed }, {});
+    await runtime.socket.sendPresenceUpdate("paused", jid).catch(() => undefined);
+  } catch (error) {
+    if (isAntibanBlockError(error)) {
+      throw new SessionError(antibanBlockMessage(error), 429);
+    }
+    throw error;
+  }
+
+  logger.info({ sessionId, groupName: name }, "Sent WhatsApp group message");
+  return { groupName: name, jid };
+}
+
 async function waitForPairingReady(
   sessionId: string,
   socket: WASocket,

@@ -1,6 +1,7 @@
 import express from "express";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
+import { bloodLabBookingsRouter } from "./routes/bloodLabBookings.js";
 import { healthRouter } from "./routes/health.js";
 import { sessionsRouter } from "./routes/sessions.js";
 import { restoreSession } from "./baileys/sessionManager.js";
@@ -10,6 +11,7 @@ const app = express();
 app.use(express.json());
 app.use(`${config.basePath}/health`, healthRouter);
 app.use(`${config.basePath}/sessions`, sessionsRouter);
+app.use(`${config.basePath}/webhooks/blood-lab-bookings`, bloodLabBookingsRouter);
 
 app.use(
   (

@@ -21,3 +21,5 @@ services:
         sync: false
       - key: ADMIN_API_KEY
         sync: false
+      - key: BLOOD_BOOKING_WEBHOOK_SECRET
+        sync: false

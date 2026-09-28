@@ -33,6 +33,8 @@ export const config = {
   basePath: envBasePath(),
   defaultSessionId,
   adminApiKey: envString("ADMIN_API_KEY"),
+  bloodBookingWebhookSecret: envString("BLOOD_BOOKING_WEBHOOK_SECRET"),
+  bloodBookingGroupName: envString("BLOOD_BOOKING_GROUP_NAME", "Test Group").trim() || "Test Group",
   supabaseUrl: envString("SUPABASE_URL"),
   supabaseServiceRoleKey: envString("SUPABASE_SERVICE_ROLE_KEY"),
   antiban: {
