@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS public.whatsapp_baileys_sessions (
   connected_at timestamptz,
   paused boolean NOT NULL DEFAULT false,
   daily_cap integer,
+  lease_owner text,
+  lease_expires_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT whatsapp_baileys_sessions_status_check
@@ -31,6 +33,14 @@ ALTER TABLE public.whatsapp_baileys_sessions
 
 ALTER TABLE public.whatsapp_baileys_sessions
   ADD COLUMN IF NOT EXISTS antiban_state jsonb;
+
+-- Only one server instance may hold a login at a time (deploys briefly run two).
+-- Two instances on the same keys corrupt each other's encryption sessions.
+ALTER TABLE public.whatsapp_baileys_sessions
+  ADD COLUMN IF NOT EXISTS lease_owner text;
+
+ALTER TABLE public.whatsapp_baileys_sessions
+  ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
 
 UPDATE public.whatsapp_baileys_sessions
 SET session_id = gym_id::text

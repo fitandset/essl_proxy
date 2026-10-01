@@ -53,18 +53,51 @@ server {
 EOF
 
 gunicorn --bind "0.0.0.0:${ESSL_PORT}" --workers 1 --threads 6 --timeout 120 proxy:app &
+GUNICORN_PID=$!
 
 # Restart WhatsApp Node only. Gunicorn/ESSL is not in this loop.
+# On SIGTERM, Node must get the signal and finish exiting: it saves the WhatsApp
+# encryption keys and hands the login over to the next deploy before it quits.
 (
   export PORT="${WA_PORT}"
   export BASE_PATH="${BASE_PATH:-/wa}"
   cd /app/whatsapp
-  while true; do
+  stopping=0
+  node_pid=""
+  trap 'stopping=1; if [ -n "$node_pid" ]; then kill -TERM "$node_pid" 2>/dev/null || true; fi' TERM
+  while [ "$stopping" -eq 0 ]; do
     echo "start.sh: starting WhatsApp Node" >&2
-    node dist/index.js || echo "start.sh: WhatsApp Node exited ($?)" >&2
-    echo "start.sh: restarting WhatsApp Node in 5s" >&2
+    node dist/index.js &
+    node_pid=$!
+    status=0
+    wait "$node_pid" || status=$?
+    if [ "$stopping" -eq 1 ]; then
+      # The first wait returns as soon as the trap runs, not when Node exits.
+      wait "$node_pid" 2>/dev/null || true
+      break
+    fi
+    echo "start.sh: WhatsApp Node exited (${status}); restarting in 5s" >&2
     sleep 5
   done
 ) &
+WA_PID=$!
 
-nginx -g "daemon off;"
+nginx -g "daemon off;" &
+NGINX_PID=$!
+
+stop_children() {
+  trap '' TERM INT
+  kill -TERM "$WA_PID" "$GUNICORN_PID" 2>/dev/null || true
+  wait "$WA_PID" 2>/dev/null || true
+  wait "$GUNICORN_PID" 2>/dev/null || true
+  kill -TERM "$NGINX_PID" 2>/dev/null || true
+  wait "$NGINX_PID" 2>/dev/null || true
+}
+
+trap 'echo "start.sh: stopping" >&2; stop_children; exit 0' TERM INT
+
+status=0
+wait "$NGINX_PID" || status=$?
+echo "start.sh: nginx exited (${status})" >&2
+stop_children
+exit "$status"

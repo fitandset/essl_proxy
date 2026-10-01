@@ -6,6 +6,8 @@ Links **one WhatsApp number** (session id `default`) with a QR code **or** an 8-
 
 Login is stored in the Supabase table `whatsapp_baileys_sessions` (row `session_id = default` unless you set `SESSION_ID`). Run `sql/whatsapp_baileys_sessions.sql` on your database before starting the server.
 
+Only one running server may use a login at a time: two copies on the same encryption keys corrupt each other and messages stop decrypting. The server takes a lease on the row (`lease_owner`, `lease_expires_at`) before connecting. During a deploy the new instance waits until the old one has saved its keys and released the lease on `SIGTERM`, or until the lease expires 60 seconds after a crash. A local server pointed at the same database will also wait.
+
 ## Local development
 
 ```bash

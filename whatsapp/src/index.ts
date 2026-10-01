@@ -1,10 +1,14 @@
 import express from "express";
+import type { Server } from "node:http";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { bloodLabBookingsRouter } from "./routes/bloodLabBookings.js";
 import { healthRouter } from "./routes/health.js";
 import { sessionsRouter } from "./routes/sessions.js";
-import { restoreSession } from "./baileys/sessionManager.js";
+import { restoreSession, shutdownSessions } from "./baileys/sessionManager.js";
+
+const RESTORE_RETRY_MS = 15_000;
+const SHUTDOWN_TIMEOUT_MS = 10_000;
 
 const app = express();
 
@@ -25,16 +29,63 @@ app.use(
   },
 );
 
-async function bootstrap(): Promise<void> {
+let server: Server | null = null;
+let shuttingDown = false;
+
+async function shutdown(reason: string, exitCode: number): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  logger.warn({ reason }, "Shutting down — saving the WhatsApp session first");
+
+  setTimeout(() => process.exit(exitCode), SHUTDOWN_TIMEOUT_MS).unref();
+  server?.close();
+  try {
+    await shutdownSessions();
+  } catch (err) {
+    logger.error({ err }, "Failed to save the WhatsApp session during shutdown");
+  }
+  process.exit(exitCode);
+}
+
+// Baileys rejects promises from background work (message retries, receipts). On Node 22
+// an unhandled rejection kills the process and loses unsaved encryption keys.
+process.on("unhandledRejection", (reason) => {
+  logger.error({ err: reason }, "Unhandled promise rejection");
+});
+
+process.on("uncaughtException", (err) => {
+  logger.fatal({ err }, "Uncaught exception");
+  void shutdown("uncaughtException", 1);
+});
+
+process.on("SIGTERM", () => void shutdown("SIGTERM", 0));
+process.on("SIGINT", () => void shutdown("SIGINT", 0));
+
+async function restoreInBackground(): Promise<void> {
+  while (!shuttingDown) {
+    try {
+      await restoreSession();
+      return;
+    } catch (err) {
+      logger.error({ err }, "Could not restore the WhatsApp session — retrying");
+      await new Promise((resolve) => setTimeout(resolve, RESTORE_RETRY_MS));
+    }
+  }
+}
+
+function bootstrap(): void {
   if (!config.supabaseUrl || !config.supabaseServiceRoleKey) {
-    throw new Error(
+    logger.fatal(
       "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY so WhatsApp login can be saved in whatsapp_baileys_sessions.",
     );
+    process.exit(1);
   }
 
-  await restoreSession();
-
-  app.listen(config.port, () => {
+  // Listen before restoring: during a deploy the restore waits for the old instance
+  // to hand over the login, and that only happens once this one passes health checks.
+  server = app.listen(config.port, () => {
     logger.info(
       {
         port: config.port,
@@ -45,6 +96,8 @@ async function bootstrap(): Promise<void> {
       "Bailey WhatsApp service started",
     );
   });
+
+  void restoreInBackground();
 }
 
-void bootstrap();
+bootstrap();
